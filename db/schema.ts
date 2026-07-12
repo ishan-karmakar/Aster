@@ -64,3 +64,19 @@ export const calendarEventLinks = sqliteTable("calendar_event_links", {
   eventUpdated: text("event_updated"),
   sessionUpdated: text("session_updated"),
 }, (table) => [uniqueIndex("calendar_event_links_owner_session_idx").on(table.userEmail, table.sessionId)]);
+
+export const calendarWebhooks = sqliteTable("calendar_webhooks", {
+  channelId: text("channel_id").primaryKey(),
+  userEmail: text("user_email").notNull(),
+  resourceId: text("resource_id"),
+  expiration: text("expiration"),
+  createdAt: integer("created_at").notNull().default(0),
+}, (table) => [index("calendar_webhooks_owner_idx").on(table.userEmail)]);
+
+export const calendarSyncQueue = sqliteTable("calendar_sync_queue", {
+  userEmail: text("user_email").primaryKey(),
+  requestedAt: integer("requested_at").notNull().default(0),
+  attempts: integer("attempts").notNull().default(0),
+  nextAttemptAt: integer("next_attempt_at").notNull().default(0),
+  lastError: text("last_error"),
+});
