@@ -34,3 +34,16 @@ The Supabase project URL and publishable browser key used by the app are intenti
 The app uses the vinext Cloudflare-compatible build configured in `vite.config.ts`. Sites deployment metadata and D1 migrations live under `.openai/` and `drizzle/`.
 
 Live app: [Aster Homework Planner](https://aster-homework-planner.yashman9012.chatgpt.site)
+
+## Assignment reminder emails
+
+Assignments and their reminder times are stored in D1 as UTC timestamps. A Cloudflare Cron Trigger should invoke the Worker every minute so due reminders are delivered close to the selected time.
+
+Required Worker configuration:
+
+- Secret: `RESEND_API_KEY`
+- Variable: `REMINDER_FROM_EMAIL` (for example, `Aster <reminders@yourdomain.com>`)
+- Variable: `HOME_URL` (the configurable homepage used in reminder emails)
+- Cron Trigger: `* * * * *`
+
+The sender domain must be verified in Resend. The Worker uses an idempotency key per assignment, records successful delivery, and retries failed requests up to five times. See `wrangler.reminders.example.jsonc` for the configuration shape.

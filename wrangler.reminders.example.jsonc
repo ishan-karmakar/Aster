@@ -1,0 +1,16 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "aster-homework-planner",
+  "triggers": { "crons": ["* * * * *"] },
+  "vars": {
+    "HOME_URL": "https://planner.example.com",
+    "REMINDER_FROM_EMAIL": "Aster <reminders@example.com>"
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "aster-homework-planner",
+      "database_id": "replace-with-your-d1-database-id"
+    }
+  ]
+}
