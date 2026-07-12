@@ -1,4 +1,4 @@
-type LocalProfile = { fullName: string; username: string; email: string; classes: string[] };
+type LocalProfile = { fullName: string; username: string; email: string; classes: string[]; terms: Array<{id:string;season:string;year:number;classes:string[]}>; activeTermId: string };
 export type LocalAssignment = { id: number; subject: string; title: string; due: string; priority: string; hours: number; progress: number; reminderLabel: string; reminderAt: string | null };
 
 type LocalStore = {
@@ -13,4 +13,3 @@ export const localStore = root.__asterLocalStore ??= {
   assignments: new Map(),
   nextAssignmentId: 1,
 };
-
