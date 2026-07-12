@@ -1,0 +1,133 @@
+import { getD1 } from "@/db/runtime";
+import { decryptToken, encryptToken } from "@/lib/secure-token";
+export async function GET(request: Request) {
+  const url = new URL(request.url),
+    code = url.searchParams.get("code"),
+    state = url.searchParams.get("state"),
+    clientId = process.env.GOOGLE_CLIENT_ID || "",
+    clientSecret = process.env.GOOGLE_CLIENT_SECRET || "",
+    redirectUri = process.env.GOOGLE_REDIRECT_URI || "",
+    secret = process.env.TOKEN_ENCRYPTION_KEY || "";
+  if (!code || !state || !clientId || !clientSecret || !redirectUri || !secret)
+    return new Response("Invalid calendar callback.", { status: 400 });
+  try {
+    const decoded = JSON.parse(await decryptToken(state, secret)) as {
+      email: string;
+      expires: number;
+    };
+    if (decoded.expires < Date.now()) throw new Error("Expired state");
+    const tokenResponse = await fetch("https://oauth2.googleapis.com/token", {
+        method: "POST",
+        headers: { "content-type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({
+          code,
+          client_id: clientId,
+          client_secret: clientSecret,
+          redirect_uri: redirectUri,
+          grant_type: "authorization_code",
+        }),
+      }),
+      tokens = (await tokenResponse.json()) as {
+        access_token?: string;
+        refresh_token?: string;
+      };
+    if (!tokenResponse.ok || !tokens.access_token || !tokens.refresh_token)
+      throw new Error("Token exchange failed");
+    const userResponse = await fetch(
+        "https://www.googleapis.com/oauth2/v2/userinfo",
+        { headers: { authorization: `Bearer ${tokens.access_token}` } },
+      ),
+      user = (await userResponse.json()) as { email?: string };
+    if (!userResponse.ok) throw new Error("Google profile lookup failed");
+    const calendarResponse = await fetch(
+        "https://www.googleapis.com/calendar/v3/calendars",
+        {
+          method: "POST",
+          headers: {
+            authorization: `Bearer ${tokens.access_token}`,
+            "content-type": "application/json",
+          },
+          body: JSON.stringify({
+            summary: "Aster Study Plan",
+            description: "Study sessions scheduled by Aster",
+          }),
+        },
+      ),
+      calendar = (await calendarResponse.json()) as { id?: string };
+    if (!calendarResponse.ok || !calendar.id)
+      throw new Error("Aster calendar creation failed");
+    const db = await getD1();
+    if (!db) throw new Error("Database unavailable");
+    await db.batch([
+      db.prepare(
+        "CREATE TABLE IF NOT EXISTS calendar_connections (user_email TEXT PRIMARY KEY NOT NULL, provider TEXT NOT NULL, refresh_token TEXT NOT NULL, calendar_id TEXT, provider_email TEXT, sync_token TEXT, status TEXT NOT NULL DEFAULT 'connected', updated_at INTEGER NOT NULL DEFAULT (unixepoch()))",
+      ),
+      db.prepare(
+        "CREATE TABLE IF NOT EXISTS calendar_webhooks (channel_id TEXT PRIMARY KEY NOT NULL, user_email TEXT NOT NULL, resource_id TEXT, expiration TEXT, created_at INTEGER NOT NULL DEFAULT (unixepoch()))",
+      ),
+      db.prepare(
+        "CREATE TABLE IF NOT EXISTS calendar_sync_queue (user_email TEXT PRIMARY KEY NOT NULL, requested_at INTEGER NOT NULL DEFAULT (unixepoch()))",
+      ),
+    ]);
+    await db
+      .prepare(
+        "INSERT INTO calendar_connections (user_email,provider,refresh_token,calendar_id,provider_email) VALUES (?,?,?,?,?) ON CONFLICT(user_email) DO UPDATE SET refresh_token=excluded.refresh_token,calendar_id=excluded.calendar_id,provider_email=excluded.provider_email,status='connected',updated_at=unixepoch()",
+      )
+      .bind(
+        decoded.email,
+        "google",
+        await encryptToken(tokens.refresh_token, secret),
+        calendar.id,
+        user.email || "",
+      )
+      .run();
+    const webhookUrl = process.env.GOOGLE_WEBHOOK_URL;
+    if (webhookUrl) {
+      const channelId = crypto.randomUUID(),
+        channelToken = await encryptToken(
+          JSON.stringify({ email: decoded.email }),
+          secret,
+        ),
+        watchResponse = await fetch(
+          `https://www.googleapis.com/calendar/v3/calendars/${encodeURIComponent(calendar.id)}/events/watch`,
+          {
+            method: "POST",
+            headers: {
+              authorization: `Bearer ${tokens.access_token}`,
+              "content-type": "application/json",
+            },
+            body: JSON.stringify({
+              id: channelId,
+              type: "web_hook",
+              address: webhookUrl,
+              token: channelToken,
+            }),
+          },
+        ),
+        watch = (await watchResponse.json()) as {
+          resourceId?: string;
+          expiration?: string;
+        };
+      if (watchResponse.ok)
+        await db
+          .prepare(
+            "INSERT INTO calendar_webhooks (channel_id,user_email,resource_id,expiration) VALUES (?,?,?,?)",
+          )
+          .bind(
+            channelId,
+            decoded.email,
+            watch.resourceId || null,
+            watch.expiration || null,
+          )
+          .run();
+    }
+    return Response.redirect(
+      new URL("/settings?tab=integrations&connected=google", request.url),
+    );
+  } catch {
+    return new Response(
+      "Google Calendar connection failed. Return to Aster and try again.",
+      { status: 400 },
+    );
+  }
+}

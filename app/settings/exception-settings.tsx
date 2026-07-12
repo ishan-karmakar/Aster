@@ -1,0 +1,113 @@
+"use client";
+import { FormEvent, useEffect, useState } from "react";
+import type { PlannerState, ScheduleException } from "@/lib/planner";
+export function ExceptionSettings({ token }: { token: string }) {
+  const [state, setState] = useState<PlannerState | null>(null),
+    [message, setMessage] = useState("");
+  useEffect(() => {
+    void fetch("/api/planner", {
+      headers: { authorization: `Bearer ${token}` },
+    })
+      .then((response) => response.json())
+      .then((data) => setState(data.state));
+  }, [token]);
+  async function persist(next: PlannerState, text: string) {
+    const response = await fetch("/api/planner", {
+        method: "PUT",
+        headers: {
+          "content-type": "application/json",
+          authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify(next),
+      }),
+      data = await response.json();
+    setState(data.state);
+    setMessage(text);
+  }
+  async function add(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!state) return;
+    const form = event.currentTarget,
+      data = new FormData(form),
+      exception: ScheduleException = {
+        id: crypto.randomUUID(),
+        title: String(data.get("title")),
+        start: new Date(String(data.get("start"))).toISOString(),
+        end: new Date(String(data.get("end"))).toISOString(),
+        source: "manual",
+      };
+    await persist(
+      {
+        ...state,
+        preferences: {
+          ...state.preferences,
+          exceptions: [...(state.preferences.exceptions || []), exception],
+        },
+      },
+      "Exception added.",
+    );
+    form.reset();
+  }
+  async function remove(id: string) {
+    if (state)
+      await persist(
+        {
+          ...state,
+          preferences: {
+            ...state.preferences,
+            exceptions: (state.preferences.exceptions || []).filter(
+              (item) => item.id !== id,
+            ),
+          },
+        },
+        "Exception removed.",
+      );
+  }
+  if (!state) return null;
+  return (
+    <div className="settings-card">
+      <div className="settings-card-head">
+        <span className="settings-class-icon">!</span>
+        <div>
+          <h2>One-off exceptions</h2>
+          <p>
+            Block appointments, travel, or days when normal availability
+            changes.
+          </p>
+        </div>
+      </div>
+      <form className="term-form" onSubmit={add}>
+        <label>
+          Name
+          <input name="title" placeholder="Dentist appointment" required />
+        </label>
+        <div className="form-pair">
+          <label>
+            Starts
+            <input name="start" type="datetime-local" required />
+          </label>
+          <label>
+            Ends
+            <input name="end" type="datetime-local" required />
+          </label>
+        </div>
+        <button className="bright-button">Block this time</button>
+      </form>
+      <div className="class-preview class-actions">
+        {(state.preferences.exceptions || [])
+          .filter((item) => item.source === "manual")
+          .map((item) => (
+            <button
+              type="button"
+              key={item.id}
+              onClick={() => void remove(item.id)}
+            >
+              {item.title} · {new Date(item.start).toLocaleString()}
+              <span>×</span>
+            </button>
+          ))}
+      </div>
+      {message && <p className="settings-message">{message}</p>}
+    </div>
+  );
+}

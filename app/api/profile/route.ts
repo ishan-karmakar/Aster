@@ -1,0 +1,169 @@
+import { SUPABASE_PUBLISHABLE_KEY, SUPABASE_URL } from "@/app/supabase";
+import { getD1 } from "@/db/runtime";
+import { localStore } from "@/app/api/local-store";
+async function emailFor(request: Request) {
+  const authorization = request.headers.get("authorization");
+  if (!authorization?.startsWith("Bearer ")) return null;
+  const response = await fetch(`${SUPABASE_URL}/auth/v1/user`, {
+    headers: { apikey: SUPABASE_PUBLISHABLE_KEY, authorization },
+  });
+  if (!response.ok) return null;
+  return ((await response.json()) as { email?: string }).email || null;
+}
+async function ensure(db: D1Database) {
+  await db.batch([
+    db.prepare(
+      "CREATE TABLE IF NOT EXISTS profiles (email TEXT PRIMARY KEY NOT NULL, full_name TEXT NOT NULL, username TEXT NOT NULL UNIQUE, classes TEXT NOT NULL DEFAULT '[]', created_at INTEGER NOT NULL DEFAULT (unixepoch()), updated_at INTEGER NOT NULL DEFAULT (unixepoch()))",
+    ),
+    db.prepare(
+      "CREATE UNIQUE INDEX IF NOT EXISTS profiles_username_idx ON profiles(username)",
+    ),
+  ]);
+}
+function normalize(raw: unknown) {
+  if (Array.isArray(raw)) {
+    const id = "legacy";
+    return {
+      terms: [
+        {
+          id,
+          season: "Fall",
+          year: new Date().getFullYear(),
+          classes: raw.map(String),
+        },
+      ],
+      activeTermId: id,
+    };
+  }
+  const value = raw as {
+    terms?: Array<{
+      id: string;
+      season: string;
+      year: number;
+      classes: string[];
+    }>;
+    activeTermId?: string;
+  };
+  const terms = (value?.terms || []).map((term) => ({
+    ...term,
+    classes: (term.classes || []).map(String),
+  }));
+  return { terms, activeTermId: value?.activeTermId || terms[0]?.id || "" };
+}
+export async function GET(request: Request) {
+  const email = await emailFor(request);
+  if (!email) return Response.json({ error: "Unauthorized" }, { status: 401 });
+  const db = await getD1();
+  if (!db)
+    return Response.json({ profile: localStore.profiles.get(email) ?? null });
+  try {
+    await ensure(db);
+    const row = await db
+      .prepare(
+        "SELECT full_name AS fullName, username, email, classes FROM profiles WHERE email=?",
+      )
+      .bind(email)
+      .first<{
+        fullName: string;
+        username: string;
+        email: string;
+        classes: string;
+      }>();
+    if (!row) return Response.json({ profile: null });
+    const termData = normalize(JSON.parse(row.classes || "[]")),
+      classes =
+        termData.terms.find((term) => term.id === termData.activeTermId)
+          ?.classes || [];
+    return Response.json({ profile: { ...row, ...termData, classes } });
+  } catch {
+    return Response.json({ profile: null });
+  }
+}
+export async function PUT(request: Request) {
+  const email = await emailFor(request);
+  if (!email)
+    return Response.json({ error: "Please sign in again." }, { status: 401 });
+  const body = (await request.json()) as {
+    fullName?: string;
+    username?: string;
+    terms?: Array<{
+      id: string;
+      season: string;
+      year: number;
+      classes: string[];
+    }>;
+    activeTermId?: string;
+  };
+  const fullName = body.fullName?.trim(),
+    username = body.username?.trim().toLowerCase(),
+    terms = (body.terms || []).map((term) => ({
+      ...term,
+      season: term.season?.trim(),
+      year: Number(term.year),
+      classes: (term.classes || []).map((x) => x.trim()).filter(Boolean),
+    })),
+    activeTermId = body.activeTermId || terms[0]?.id || "",
+    active = terms.find((term) => term.id === activeTermId);
+  if (
+    !fullName ||
+    !username ||
+    !/^[a-z0-9_-]{3,24}$/.test(username) ||
+    !active ||
+    !terms.length ||
+    terms.some(
+      (term) =>
+        !["Spring", "Summer", "Fall"].includes(term.season) ||
+        !term.year ||
+        !term.classes.length,
+    )
+  )
+    return Response.json(
+      {
+        error:
+          "Enter a valid name, username, term, and at least one class per term.",
+      },
+      { status: 400 },
+    );
+  const classes = active.classes,
+    stored = JSON.stringify({ terms, activeTermId }),
+    db = await getD1();
+  if (!db) {
+    const taken = [...localStore.profiles.values()].some(
+      (profile) => profile.username === username && profile.email !== email,
+    );
+    if (taken)
+      return Response.json(
+        { error: "That username is already taken." },
+        { status: 409 },
+      );
+    localStore.profiles.set(email, {
+      fullName,
+      username,
+      email,
+      classes,
+      terms,
+      activeTermId,
+    });
+    return Response.json({ ok: true });
+  }
+  try {
+    await ensure(db);
+    await db
+      .prepare(
+        "INSERT INTO profiles (email,full_name,username,classes) VALUES (?,?,?,?) ON CONFLICT(email) DO UPDATE SET full_name=excluded.full_name,username=excluded.username,classes=excluded.classes,updated_at=unixepoch()",
+      )
+      .bind(email, fullName, username, stored)
+      .run();
+    return Response.json({ ok: true });
+  } catch (error) {
+    return Response.json(
+      {
+        error:
+          error instanceof Error && error.message.includes("UNIQUE")
+            ? "That username is already taken."
+            : "Profile could not be saved.",
+      },
+      { status: 409 },
+    );
+  }
+}

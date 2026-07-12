@@ -1,0 +1,189 @@
+"use client";
+import { FormEvent, useState } from "react";
+type Item = {
+  title: string;
+  subject: string;
+  due: string;
+  type: "assignment" | "exam";
+  estimatedMinutes: number;
+  confidence: number;
+  selected: boolean;
+};
+export function SyllabusImporter({
+  token,
+  termId,
+}: {
+  token: string;
+  termId: string;
+}) {
+  const [items, setItems] = useState<Item[]>([]),
+    [importId, setImportId] = useState(""),
+    [message, setMessage] = useState("");
+  async function upload(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const response = await fetch("/api/imports", {
+        method: "POST",
+        headers: { authorization: `Bearer ${token}` },
+        body: new FormData(event.currentTarget),
+      }),
+      data = await response.json();
+    if (!response.ok) {
+      setMessage(data.error || "Extraction failed.");
+      return;
+    }
+    setImportId(data.importId);
+    setItems(
+      (data.items || []).map((item: Omit<Item, "selected">) => ({
+        ...item,
+        selected: true,
+      })),
+    );
+    setMessage("Review every field. Nothing is imported until you confirm.");
+  }
+  function edit(index: number, changes: Partial<Item>) {
+    setItems((current) =>
+      current.map((item, itemIndex) =>
+        itemIndex === index ? { ...item, ...changes } : item,
+      ),
+    );
+  }
+  async function confirm() {
+    const selected = items.filter((item) => item.selected);
+    if (
+      selected.some(
+        (item) =>
+          !item.title || !item.subject || !item.due || !item.estimatedMinutes,
+      )
+    ) {
+      setMessage(
+        "Complete every selected title, class, deadline, and estimate.",
+      );
+      return;
+    }
+    const response = await fetch("/api/imports", {
+        method: "PATCH",
+        headers: {
+          "content-type": "application/json",
+          authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({ importId, termId, items: selected }),
+      }),
+      data = await response.json();
+    if (!response.ok) {
+      setMessage(data.error || "Import failed.");
+      return;
+    }
+    setItems([]);
+    setMessage(
+      `${data.imported} items imported and scheduled${data.duplicates ? `; ${data.duplicates} duplicates skipped` : ""}.`,
+    );
+  }
+  return (
+    <div className="settings-card">
+      <div className="settings-card-head">
+        <span className="settings-class-icon">⇧</span>
+        <div>
+          <h2>Syllabus import</h2>
+          <p>AI extraction is always reviewed before saving.</p>
+        </div>
+      </div>
+      <form className="import-drop" onSubmit={upload}>
+        <strong>Choose a syllabus</strong>
+        <p>PDF, PNG, or JPEG up to 10 MB</p>
+        <input
+          name="file"
+          type="file"
+          accept="application/pdf,image/png,image/jpeg"
+          required
+        />
+        <button className="bright-button">Extract for review</button>
+      </form>
+      {items.map((item, index) => (
+        <div className="import-review" key={index}>
+          <input
+            type="checkbox"
+            checked={item.selected}
+            onChange={(event) =>
+              edit(index, { selected: event.target.checked })
+            }
+          />
+          <div>
+            <label>
+              Title
+              <input
+                value={item.title}
+                onChange={(event) => edit(index, { title: event.target.value })}
+              />
+            </label>
+            <div className="form-pair">
+              <label>
+                Class
+                <input
+                  value={item.subject}
+                  onChange={(event) =>
+                    edit(index, { subject: event.target.value })
+                  }
+                />
+              </label>
+              <label>
+                Type
+                <select
+                  value={item.type}
+                  onChange={(event) =>
+                    edit(index, { type: event.target.value as Item["type"] })
+                  }
+                >
+                  <option value="assignment">Assignment</option>
+                  <option value="exam">Exam</option>
+                </select>
+              </label>
+            </div>
+            <div className="form-pair">
+              <label>
+                Deadline
+                <input
+                  type="datetime-local"
+                  value={item.due ? localDate(item.due) : ""}
+                  onChange={(event) =>
+                    edit(index, {
+                      due: new Date(event.target.value).toISOString(),
+                    })
+                  }
+                />
+              </label>
+              <label>
+                Estimated minutes
+                <input
+                  type="number"
+                  min="15"
+                  step="15"
+                  value={item.estimatedMinutes}
+                  onChange={(event) =>
+                    edit(index, {
+                      estimatedMinutes: Number(event.target.value),
+                    })
+                  }
+                />
+              </label>
+            </div>
+            <small>
+              {Math.round(item.confidence * 100)}% extraction confidence
+            </small>
+          </div>
+        </div>
+      ))}
+      {!!items.length && (
+        <button className="bright-button" onClick={() => void confirm()}>
+          Confirm selected items
+        </button>
+      )}
+      {message && <p className="settings-message">{message}</p>}
+    </div>
+  );
+}
+function localDate(value: string) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "";
+  date.setMinutes(date.getMinutes() - date.getTimezoneOffset());
+  return date.toISOString().slice(0, 16);
+}

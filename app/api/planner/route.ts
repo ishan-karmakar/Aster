@@ -1,0 +1,167 @@
+import { SUPABASE_PUBLISHABLE_KEY, SUPABASE_URL } from "@/app/supabase";
+import {
+  generateSchedule,
+  markMissedAndReschedule,
+  validateSessionMove,
+  type Difficulty,
+  type PlannerState,
+} from "@/lib/planner";
+import { readPlannerState, writePlannerState } from "@/lib/planner-store";
+
+async function emailFor(request: Request) {
+  const authorization = request.headers.get("authorization");
+  if (!authorization?.startsWith("Bearer ")) return null;
+  const response = await fetch(`${SUPABASE_URL}/auth/v1/user`, {
+    headers: { apikey: SUPABASE_PUBLISHABLE_KEY, authorization },
+  });
+  if (!response.ok) return null;
+  return ((await response.json()) as { email?: string }).email || null;
+}
+export async function GET(request: Request) {
+  const email = await emailFor(request);
+  if (!email) return Response.json({ error: "Unauthorized" }, { status: 401 });
+  const state = markMissedAndReschedule(await readPlannerState(email));
+  await writePlannerState(email, state);
+  return Response.json({ state });
+}
+export async function PUT(request: Request) {
+  const email = await emailFor(request);
+  if (!email) return Response.json({ error: "Unauthorized" }, { status: 401 });
+  const state = (await request.json()) as PlannerState;
+  await writePlannerState(email, state);
+  return Response.json({ state });
+}
+export async function POST(request: Request) {
+  const email = await emailFor(request);
+  if (!email) return Response.json({ error: "Unauthorized" }, { status: 401 });
+  const body = (await request.json()) as {
+    action: string;
+    termId?: string;
+    sessionId?: string;
+    actualMinutes?: number;
+    difficulty?: Difficulty;
+    location?: string;
+    trigger?: string;
+    start?: string;
+    end?: string;
+  };
+  let state = await readPlannerState(email);
+  if (body.action === "generate") {
+    if (body.termId)
+      state = {
+        ...state,
+        preferences: { ...state.preferences, activeTermId: body.termId },
+      };
+    state = generateSchedule(state);
+  }
+  if (body.action === "move" && body.sessionId && body.start && body.end) {
+    const error = validateSessionMove(
+      state,
+      body.sessionId,
+      body.start,
+      body.end,
+    );
+    if (error) return Response.json({ error }, { status: 409 });
+    state = {
+      ...state,
+      sessions: state.sessions.map((session) =>
+        session.id === body.sessionId
+          ? {
+              ...session,
+              start: new Date(body.start!).toISOString(),
+              end: new Date(body.end!).toISOString(),
+              location: body.location ?? session.location,
+              trigger: body.trigger ?? session.trigger,
+              updatedAt: new Date().toISOString(),
+            }
+          : session,
+      ),
+    };
+  }
+  if (body.action === "complete") {
+    const target = state.sessions.find(
+      (session) => session.id === body.sessionId,
+    );
+    state = {
+      ...state,
+      sessions: state.sessions.map((session) =>
+        session.id === body.sessionId
+          ? {
+              ...session,
+              status: "completed",
+              actualMinutes: body.actualMinutes || null,
+              difficulty: body.difficulty || null,
+              location: body.location || session.location,
+              trigger: body.trigger || session.trigger,
+              updatedAt: new Date().toISOString(),
+            }
+          : session,
+      ),
+    };
+    if (target?.subtaskId) {
+      const remaining = state.sessions.some(
+        (session) =>
+          session.id !== target.id &&
+          session.subtaskId === target.subtaskId &&
+          session.status === "planned",
+      );
+      if (!remaining)
+        state = {
+          ...state,
+          assignments: state.assignments.map((assignment) =>
+            assignment.id !== target.assignmentId
+              ? assignment
+              : {
+                  ...assignment,
+                  subtasks: assignment.subtasks.map((item) =>
+                    item.id === target.subtaskId
+                      ? { ...item, completed: true }
+                      : item,
+                  ),
+                },
+          ),
+        };
+    }
+    state = {
+      ...state,
+      assignments: state.assignments.map((assignment) =>
+        assignment.subtasks.length &&
+        assignment.subtasks.every((item) => item.completed)
+          ? { ...assignment, status: "completed" }
+          : assignment,
+      ),
+    };
+  }
+  if (body.action === "skip") {
+    state = {
+      ...state,
+      sessions: state.sessions.map((session) =>
+        session.id === body.sessionId
+          ? {
+              ...session,
+              status: "skipped",
+              updatedAt: new Date().toISOString(),
+            }
+          : session,
+      ),
+    };
+    state = generateSchedule(
+      state,
+      new Date(),
+      "Skipped work was redistributed",
+    );
+  }
+  if (body.action === "undo") {
+    const revision = state.revisions.find((item) => !item.undone);
+    if (revision)
+      state = {
+        ...state,
+        sessions: revision.before,
+        revisions: state.revisions.map((item) =>
+          item.id === revision.id ? { ...item, undone: true } : item,
+        ),
+      };
+  }
+  await writePlannerState(email, state);
+  return Response.json({ state });
+}

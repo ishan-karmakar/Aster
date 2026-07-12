@@ -1,0 +1,252 @@
+import { SUPABASE_PUBLISHABLE_KEY, SUPABASE_URL } from "@/app/supabase";
+import { getD1 } from "@/db/runtime";
+import { localStore, type LocalAssignment } from "@/app/api/local-store";
+import {
+  assignmentProgress,
+  generateSchedule,
+  type PlannerAssignment,
+  type Subtask,
+} from "@/lib/planner";
+import { readPlannerState, writePlannerState } from "@/lib/planner-store";
+
+type AssignmentInput = {
+  termId?: string;
+  subject?: string;
+  title?: string;
+  type?: "assignment" | "exam";
+  due?: string;
+  priority?: "High" | "Medium" | "Low";
+  hours?: number;
+  estimatedMinutes?: number;
+  subtasks?: Array<Partial<Subtask> & { title: string }>;
+  practiceQuestions?: boolean;
+  practiceQuestionText?: string;
+  reminderLabel?: string;
+  reminderAt?: string | null;
+};
+async function emailFor(request: Request) {
+  const authorization = request.headers.get("authorization");
+  if (!authorization?.startsWith("Bearer ")) return null;
+  const response = await fetch(`${SUPABASE_URL}/auth/v1/user`, {
+    headers: { apikey: SUPABASE_PUBLISHABLE_KEY, authorization },
+  });
+  if (!response.ok) return null;
+  return ((await response.json()) as { email?: string }).email || null;
+}
+async function ensure(db: D1Database) {
+  await db.batch([
+    db.prepare(
+      "CREATE TABLE IF NOT EXISTS assignments (id INTEGER PRIMARY KEY AUTOINCREMENT, user_email TEXT NOT NULL, subject TEXT NOT NULL, title TEXT NOT NULL, due_at TEXT NOT NULL, priority TEXT NOT NULL, hours INTEGER NOT NULL, progress INTEGER NOT NULL DEFAULT 0, reminder_label TEXT NOT NULL DEFAULT 'Never', reminder_at TEXT, reminder_status TEXT NOT NULL DEFAULT 'pending', reminder_attempts INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL DEFAULT (unixepoch()))",
+    ),
+    db.prepare(
+      "CREATE INDEX IF NOT EXISTS assignments_owner_idx ON assignments(user_email)",
+    ),
+    db.prepare(
+      "CREATE INDEX IF NOT EXISTS assignments_reminder_idx ON assignments(reminder_status,reminder_at)",
+    ),
+  ]);
+}
+async function activeTerm(email: string, db: D1Database | null) {
+  if (!db) return localStore.profiles.get(email)?.activeTermId || "legacy";
+  const row = await db
+    .prepare("SELECT classes FROM profiles WHERE email=?")
+    .bind(email)
+    .first<{ classes: string }>();
+  try {
+    const parsed = JSON.parse(row?.classes || "[]") as {
+      activeTermId?: string;
+    };
+    return parsed.activeTermId || "legacy";
+  } catch {
+    return "legacy";
+  }
+}
+function toPlanner(item: LocalAssignment, termId: string): PlannerAssignment {
+  return {
+    id: item.id,
+    termId,
+    subject: item.subject,
+    title: item.title,
+    type: "assignment",
+    due: item.due,
+    priority: item.priority as PlannerAssignment["priority"],
+    estimatedMinutes: Math.max(15, Math.round(item.hours * 60)),
+    subtasks: [
+      {
+        id: `legacy-${item.id}`,
+        title: item.title,
+        estimatedMinutes: Math.max(15, Math.round(item.hours * 60)),
+        completed: item.progress >= 100,
+        order: 0,
+      },
+    ],
+    practiceQuestions: false,
+    status: item.progress >= 100 ? "completed" : "active",
+  };
+}
+function output(item: PlannerAssignment, reminder?: Partial<LocalAssignment>) {
+  return {
+    id: item.id,
+    subject: item.subject,
+    title: item.title,
+    due: item.due,
+    priority: item.priority,
+    hours: item.estimatedMinutes / 60,
+    progress: assignmentProgress(item),
+    reminderLabel: reminder?.reminderLabel || "Never",
+    reminderAt: reminder?.reminderAt || null,
+    type: item.type,
+    termId: item.termId,
+    estimatedMinutes: item.estimatedMinutes,
+    subtasks: item.subtasks,
+    practiceQuestions: item.practiceQuestions,
+    practiceQuestionText: item.practiceQuestionText,
+  };
+}
+
+export async function GET(request: Request) {
+  const email = await emailFor(request);
+  if (!email) return Response.json({ error: "Unauthorized" }, { status: 401 });
+  const db = await getD1(),
+    termId = await activeTerm(email, db);
+  let legacy: LocalAssignment[] = [];
+  if (!db) legacy = localStore.assignments.get(email) ?? [];
+  else {
+    await ensure(db);
+    const result = await db
+      .prepare(
+        "SELECT id,subject,title,due_at AS due,priority,hours/100.0 AS hours,progress,reminder_label AS reminderLabel,reminder_at AS reminderAt FROM assignments WHERE user_email=? ORDER BY due_at",
+      )
+      .bind(email)
+      .all<LocalAssignment>();
+    legacy = result.results;
+  }
+  let state = await readPlannerState(email);
+  const known = new Set(state.assignments.map((item) => item.id)),
+    migrated = legacy
+      .filter((item) => !known.has(item.id))
+      .map((item) => toPlanner(item, termId));
+  if (migrated.length) {
+    state = { ...state, assignments: [...state.assignments, ...migrated] };
+    await writePlannerState(email, state);
+  }
+  const reminders = new Map(legacy.map((item) => [item.id, item]));
+  return Response.json({
+    assignments: state.assignments
+      .filter((item) => item.termId === termId)
+      .map((item) => output(item, reminders.get(item.id))),
+    state,
+  });
+}
+
+export async function POST(request: Request) {
+  const email = await emailFor(request);
+  if (!email) return Response.json({ error: "Unauthorized" }, { status: 401 });
+  const body = (await request.json()) as AssignmentInput,
+    due = new Date(body.due || "");
+  if (
+    !body.subject?.trim() ||
+    !body.title?.trim() ||
+    Number.isNaN(due.getTime()) ||
+    !body.priority
+  )
+    return Response.json(
+      { error: "Missing or invalid assignment details." },
+      { status: 400 },
+    );
+  if (body.reminderAt && new Date(body.reminderAt).getTime() >= due.getTime())
+    return Response.json(
+      { error: "Reminder must be before the due time." },
+      { status: 400 },
+    );
+  const db = await getD1(),
+    minutes = Math.max(
+      15,
+      Math.round(body.estimatedMinutes || Number(body.hours || 1) * 60),
+    );
+  let id: number;
+  if (!db) {
+    id = localStore.nextAssignmentId++;
+    const legacy: LocalAssignment = {
+      id,
+      subject: body.subject,
+      title: body.title,
+      due: due.toISOString(),
+      priority: body.priority,
+      hours: minutes / 60,
+      progress: 0,
+      reminderLabel: body.reminderLabel || "Never",
+      reminderAt: body.reminderAt || null,
+    };
+    localStore.assignments.set(email, [
+      ...(localStore.assignments.get(email) ?? []),
+      legacy,
+    ]);
+  } else {
+    await ensure(db);
+    const result = await db
+      .prepare(
+        "INSERT INTO assignments (user_email,subject,title,due_at,priority,hours,reminder_label,reminder_at,reminder_status) VALUES (?,?,?,?,?,?,?,?,?)",
+      )
+      .bind(
+        email,
+        body.subject.trim(),
+        body.title.trim(),
+        due.toISOString(),
+        body.priority,
+        minutes * 100,
+        body.reminderLabel || "Never",
+        body.reminderAt || null,
+        body.reminderAt ? "pending" : "disabled",
+      )
+      .run();
+    id = result.meta?.last_row_id ?? Date.now();
+  }
+  const termId = body.termId || (await activeTerm(email, db)),
+    raw = body.subtasks?.length
+      ? body.subtasks
+      : [{ title: body.title, estimatedMinutes: minutes }],
+    subtasks: Subtask[] = raw.map((item, index) => ({
+      id: item.id || crypto.randomUUID(),
+      title: item.title.trim(),
+      estimatedMinutes: Math.max(
+        15,
+        Math.round(item.estimatedMinutes || minutes / raw.length),
+      ),
+      completed: Boolean(item.completed),
+      order: item.order ?? index,
+    })),
+    assignment: PlannerAssignment = {
+      id,
+      termId,
+      subject: body.subject.trim(),
+      title: body.title.trim(),
+      type: body.type || "assignment",
+      due: due.toISOString(),
+      priority: body.priority,
+      estimatedMinutes: minutes,
+      subtasks,
+      practiceQuestions: Boolean(body.practiceQuestions),
+      practiceQuestionText: body.practiceQuestionText,
+      status: "active",
+    };
+  let state = await readPlannerState(email);
+  state = generateSchedule(
+    {
+      ...state,
+      preferences: { ...state.preferences, activeTermId: termId },
+      assignments: [...state.assignments, assignment],
+    },
+    new Date(),
+    `${assignment.title} was added and scheduled`,
+  );
+  await writePlannerState(email, state);
+  return Response.json({
+    id,
+    state,
+    assignment: output(assignment, {
+      reminderLabel: body.reminderLabel,
+      reminderAt: body.reminderAt,
+    }),
+  });
+}

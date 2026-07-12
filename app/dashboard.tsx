@@ -1,0 +1,851 @@
+"use client";
+import { FormEvent, useEffect, useMemo, useState } from "react";
+import { AuthSession, supabaseAuth } from "./supabase";
+import { PlannerPanel } from "./planner-panel";
+type Term = {
+  id: string;
+  season: "Spring" | "Summer" | "Fall";
+  year: number;
+  classes: string[];
+};
+type Profile = {
+  fullName: string;
+  username: string;
+  email: string;
+  classes: string[];
+  terms: Term[];
+  activeTermId: string;
+};
+type Assignment = {
+  id: number;
+  title: string;
+  subject: string;
+  due: string;
+  priority: "High" | "Medium" | "Low";
+  hours: number;
+  progress: number;
+  reminderLabel: string;
+  reminderAt: string | null;
+};
+export function Dashboard() {
+  const [identity, setIdentity] = useState<{ email: string } | null>(null),
+    [token, setToken] = useState(""),
+    [loading, setLoading] = useState(true),
+    [profile, setProfile] = useState<Profile | null>(null),
+    [assignments, setAssignments] = useState<Assignment[]>([]),
+    [onboarding, setOnboarding] = useState(false),
+    [setupStep, setSetupStep] = useState<"account" | "term">("account"),
+    [setupAccount, setSetupAccount] = useState({ fullName: "", username: "" }),
+    [adding, setAdding] = useState(false),
+    [reminderChoice, setReminderChoice] = useState("1 Day Before"),
+    [toast, setToast] = useState("");
+  const completion = useMemo(
+    () =>
+      assignments.length
+        ? Math.round(
+            assignments.reduce((s, a) => s + a.progress, 0) /
+              assignments.length,
+          )
+        : 0,
+    [assignments],
+  );
+  // Session restoration intentionally runs once when the app opens.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  useEffect(() => {
+    void restore();
+  }, []);
+  function notify(text: string) {
+    setToast(text);
+    setTimeout(() => setToast(""), 2600);
+  }
+  async function restore() {
+    const saved = localStorage.getItem("aster-session");
+    if (!saved) {
+      setLoading(false);
+      return;
+    }
+    try {
+      await enter(JSON.parse(saved) as AuthSession);
+    } catch {
+      localStorage.removeItem("aster-session");
+      setLoading(false);
+    }
+  }
+  async function enter(session: AuthSession) {
+    const headers = { authorization: `Bearer ${session.access_token}` };
+    const response = await fetch("/api/profile", { headers });
+    if (response.status === 401) {
+      localStorage.removeItem("aster-session");
+      setLoading(false);
+      return;
+    }
+    const data = await readJson<{ profile: Profile | null; error?: string }>(
+      response,
+    );
+    if (!response.ok || !data) {
+      localStorage.removeItem("aster-session");
+      setLoading(false);
+      window.alert(
+        data?.error || "Aster could not open your profile. Please try again.",
+      );
+      return;
+    }
+    const assignmentResponse = await fetch("/api/assignments", { headers });
+    const assignmentData = assignmentResponse.ok
+      ? await readJson<{ assignments: Assignment[] }>(assignmentResponse)
+      : null;
+    localStorage.setItem("aster-session", JSON.stringify(session));
+    setToken(session.access_token);
+    setIdentity({ email: session.user.email });
+    setProfile(data.profile);
+    setAssignments(assignmentData?.assignments ?? []);
+    setOnboarding(!data.profile || !data.profile.classes.length);
+    setLoading(false);
+  }
+  async function saveProfile(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const f = new FormData(event.currentTarget);
+    if (setupStep === "account") {
+      setSetupAccount({
+        fullName: String(f.get("fullName")),
+        username: String(f.get("username")),
+      });
+      setSetupStep("term");
+      return;
+    }
+    const classes = String(f.get("classes") || "")
+      .split(",")
+      .map((x) => x.trim())
+      .filter(Boolean);
+    if (!classes.length) {
+      notify("Add at least one class.");
+      return;
+    }
+    const season = String(f.get("season")) as Term["season"],
+      year = Number(f.get("year")),
+      id = `${season.toLowerCase()}-${year}`,
+      terms: Term[] = [{ id, season, year, classes }],
+      next = {
+        ...setupAccount,
+        email: identity!.email,
+        classes,
+        terms,
+        activeTermId: id,
+      };
+    const response = await fetch("/api/profile", {
+      method: "PUT",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify(next),
+    });
+    if (!response.ok) {
+      notify((await response.json()).error || "Could not save profile.");
+      return;
+    }
+    setProfile(next);
+    setOnboarding(false);
+    notify("Workspace created.");
+    if (
+      window.confirm(
+        "Would you like to set your weekly availability now? You can skip this and do it later in Settings.",
+      )
+    )
+      window.location.assign("/settings?tab=schedule&onboarding=1");
+  }
+  async function addAssignment(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const f = new FormData(event.currentTarget),
+      dueLocal = String(f.get("due")),
+      custom = String(f.get("customReminder") || ""),
+      due = new Date(dueLocal).toISOString(),
+      reminderAt = computeReminderAt(due, reminderChoice, custom),
+      next = {
+        title: String(f.get("title")),
+        subject: String(f.get("subject")),
+        due,
+        priority: String(f.get("priority")) as Assignment["priority"],
+        hours: Number(f.get("hours")),
+        progress: 0,
+        reminderLabel: reminderChoice,
+        reminderAt,
+      };
+    if (reminderAt && new Date(reminderAt) >= new Date(due)) {
+      notify("Reminder must be before the due time.");
+      return;
+    }
+    const response = await fetch("/api/assignments", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify(next),
+    });
+    if (!response.ok) {
+      notify((await response.json()).error || "Assignment could not be saved.");
+      return;
+    }
+    const { id } = (await response.json()) as { id: number };
+    setAssignments((a) => [...a, { ...next, id }]);
+    window.dispatchEvent(new Event("aster-planner-updated"));
+    setAdding(false);
+    setReminderChoice("1 Day Before");
+    notify(
+      reminderAt
+        ? `Assignment added. Reminder set for ${new Date(reminderAt).toLocaleString()}.`
+        : "Assignment added without a reminder.",
+    );
+  }
+  if (loading)
+    return (
+      <main className="auth-page auth-loading">
+        <div className="auth-orb">✦</div>
+        <p>Opening your study space…</p>
+      </main>
+    );
+  if (!identity) return <AuthScreen onSession={enter} />;
+  const firstName = profile?.fullName.split(" ")[0] || "there";
+  return (
+    <main className="dark-app">
+      <aside className="dark-sidebar">
+        <a className="brand" href="#">
+          <span className="brand-mark">A</span>
+          <span>Aster</span>
+        </a>
+        <nav>
+          <small>WORKSPACE</small>
+          {[
+            ["⌂", "Today"],
+            ["□", "Calendar"],
+            ["✓", "Assignments"],
+            ["↗", "Progress"],
+          ].map((x, i) => (
+            <a
+              className={i === 0 ? "active" : ""}
+              href={`#${x[1].toLowerCase()}`}
+              key={x[1]}
+            >
+              <span>{x[0]}</span>
+              {x[1]}
+              {x[1] === "Assignments" && <b>{assignments.length}</b>}
+            </a>
+          ))}
+        </nav>
+        <div className="focus-dark">
+          <span>✦</span>
+          <strong>Focus mode</strong>
+          <p>One task. No noise. Make this session count.</p>
+          <button
+            onClick={() =>
+              notify(
+                assignments.length
+                  ? `${assignments[0].subject} is up first.`
+                  : "Add an assignment to begin.",
+              )
+            }
+          >
+            Start focus session →
+          </button>
+        </div>
+        <a className="user-chip" href="/settings">
+          <span>
+            {profile?.fullName
+              .split(" ")
+              .map((n) => n[0])
+              .slice(0, 2)
+              .join("") || "?"}
+          </span>
+          <div>
+            <strong>{profile?.fullName || "Finish setup"}</strong>
+            <small>@{profile?.username || "new-student"}</small>
+          </div>
+          <b>⚙</b>
+        </a>
+      </aside>
+      <section className="dark-workspace" id="today">
+        <header>
+          <div>
+            <small>
+              {new Date()
+                .toLocaleDateString("en-US", {
+                  weekday: "long",
+                  month: "long",
+                  day: "numeric",
+                })
+                .toUpperCase()}
+            </small>
+            <h1>Good evening, {firstName}.</h1>
+            <p>
+              {assignments.length
+                ? "Your next step is already planned."
+                : "A clear week starts with one assignment."}
+            </p>
+          </div>
+          <div>
+            <a className="ghost-button" href="/settings">
+              ⚙ Settings
+            </a>
+            <button className="bright-button" onClick={() => setAdding(true)}>
+              ＋ Add assignment
+            </button>
+          </div>
+        </header>
+        <section className="ai-dark">
+          <span>✦</span>
+          <div>
+            <small>ASTER AI</small>
+            <h2>
+              {assignments.length
+                ? "Your study plan is balanced."
+                : "Ready when you are."}
+            </h2>
+            <p>
+              {assignments.length
+                ? `${assignments.length} assignments sorted by deadline, effort, and priority.`
+                : "Add your first assignment and I’ll build a focused plan around its deadline."}
+            </p>
+          </div>
+          <button
+            onClick={() =>
+              notify(
+                assignments.length
+                  ? "Plan regenerated."
+                  : "Add an assignment first.",
+              )
+            }
+          >
+            Regenerate plan ↻
+          </button>
+        </section>
+        <PlannerPanel
+          token={token}
+          termId={profile?.activeTermId || ""}
+          classes={profile?.classes || []}
+        />
+        <div className="dashboard-grid">
+          <section className="dark-panel">
+            <div className="panel-heading">
+              <div>
+                <small>TODAY&apos;S PLAN</small>
+                <h2>
+                  {assignments.length
+                    ? "Your focus sessions"
+                    : "No sessions yet"}
+                </h2>
+              </div>
+              <span>
+                {assignments.length
+                  ? `${assignments.length} tasks`
+                  : "A fresh start"}
+              </span>
+            </div>
+            {assignments.length ? (
+              <div className="task-stack">
+                {assignments.slice(0, 3).map((a, i) => (
+                  <article key={a.id}>
+                    <time>{4 + i}:00 PM</time>
+                    <span
+                      className={`task-dot p-${a.priority.toLowerCase()}`}
+                    />
+                    <div>
+                      <small>{a.subject.toUpperCase()}</small>
+                      <strong>{a.title}</strong>
+                      <p>
+                        {a.hours}h estimated · due{" "}
+                        {new Date(a.due).toLocaleDateString("en-US", {
+                          month: "short",
+                          day: "numeric",
+                        })}
+                      </p>
+                    </div>
+                    <button
+                      onClick={() =>
+                        setAssignments((x) =>
+                          x.map((y) =>
+                            y.id === a.id
+                              ? {
+                                  ...y,
+                                  progress: Math.min(100, y.progress + 25),
+                                }
+                              : y,
+                          ),
+                        )
+                      }
+                    >
+                      +25%
+                    </button>
+                  </article>
+                ))}
+              </div>
+            ) : (
+              <Empty action={() => setAdding(true)} />
+            )}
+          </section>
+          <aside className="dark-panel progress-panel">
+            <small>WEEKLY PROGRESS</small>
+            <div
+              className="dark-ring"
+              style={{ "--p": `${completion * 3.6}deg` } as React.CSSProperties}
+            >
+              <div>
+                <strong>{completion}%</strong>
+                <span>complete</span>
+              </div>
+            </div>
+            <h3>
+              {assignments.length ? "Keep the momentum" : "Nothing overdue"}
+            </h3>
+            <p>
+              {assignments.length
+                ? "Every completed session brings the week into focus."
+                : "The best time to plan is before things feel urgent."}
+            </p>
+          </aside>
+        </div>
+        <section className="class-strip">
+          <div>
+            <small>YOUR CLASSES</small>
+            <h2>This term</h2>
+          </div>
+          <div>
+            {profile?.classes.map((name) => (
+              <span key={name}>{name}</span>
+            ))}
+          </div>
+          <a href="/settings?tab=classes">Edit in Settings</a>
+        </section>
+        <section className="dark-panel assignments-panel" id="assignments">
+          <div className="panel-heading">
+            <div>
+              <small>YOUR WORK</small>
+              <h2>Assignments</h2>
+            </div>
+            <button className="text-action" onClick={() => setAdding(true)}>
+              Add new →
+            </button>
+          </div>
+          {assignments.length ? (
+            <div className="dark-cards">
+              {assignments.map((a) => (
+                <article key={a.id}>
+                  <span
+                    className={`priority-label p-${a.priority.toLowerCase()}`}
+                  >
+                    {a.priority}
+                  </span>
+                  <small>{a.subject.toUpperCase()}</small>
+                  <h3>{a.title}</h3>
+                  <p>
+                    Due{" "}
+                    {new Date(a.due).toLocaleString("en-US", {
+                      month: "long",
+                      day: "numeric",
+                      hour: "numeric",
+                      minute: "2-digit",
+                    })}{" "}
+                    · {a.hours}h
+                  </p>
+                  <div>
+                    <i style={{ width: `${a.progress}%` }} />
+                  </div>
+                  <b>{a.progress}% complete</b>
+                </article>
+              ))}
+            </div>
+          ) : (
+            <Empty action={() => setAdding(true)} />
+          )}
+        </section>
+      </section>
+      {onboarding && (
+        <Overlay>
+          <form className="dark-modal" onSubmit={saveProfile}>
+            <div className="modal-title">
+              <span className="modal-orb">✦</span>
+            </div>
+            <small>
+              SETUP · {setupStep === "account" ? "1 OF 2" : "2 OF 2"}
+            </small>
+            {setupStep === "account" ? (
+              <>
+                <h2>Create your profile.</h2>
+                <p>Choose how you will appear in your Aster workspace.</p>
+                <label>
+                  Full name
+                  <input
+                    name="fullName"
+                    defaultValue={setupAccount.fullName}
+                    placeholder="Jordan Lee"
+                    required
+                  />
+                </label>
+                <label>
+                  Username
+                  <input
+                    name="username"
+                    defaultValue={setupAccount.username}
+                    placeholder="jordan-studies"
+                    pattern="[a-zA-Z0-9_-]{3,24}"
+                    required
+                  />
+                </label>
+                <label>
+                  Email
+                  <input value={identity.email} readOnly />
+                  <small>Verified by Supabase Auth</small>
+                </label>
+                <button className="bright-button wide" type="submit">
+                  Continue →
+                </button>
+              </>
+            ) : (
+              <>
+                <h2>Create your first term.</h2>
+                <p>
+                  Choose a season and year, then add the classes for that term.
+                </p>
+                <div className="form-pair">
+                  <label>
+                    Season
+                    <select name="season" required>
+                      <option>Spring</option>
+                      <option>Summer</option>
+                      <option>Fall</option>
+                    </select>
+                  </label>
+                  <label>
+                    Year
+                    <input
+                      name="year"
+                      type="number"
+                      min={new Date().getFullYear() - 1}
+                      max={new Date().getFullYear() + 10}
+                      defaultValue={new Date().getFullYear()}
+                      required
+                    />
+                  </label>
+                </div>
+                <label>
+                  Classes
+                  <input
+                    name="classes"
+                    placeholder="Algebra, Biology, English"
+                    required
+                  />
+                  <small>Separate classes with commas.</small>
+                </label>
+                <button className="bright-button wide" type="submit">
+                  Create my workspace
+                </button>
+                <button
+                  className="setup-back"
+                  type="button"
+                  onClick={() => setSetupStep("account")}
+                >
+                  ← Back
+                </button>
+              </>
+            )}
+          </form>
+        </Overlay>
+      )}
+      {adding && (
+        <Overlay>
+          <form className="dark-modal" onSubmit={addAssignment}>
+            <div className="modal-title">
+              <span className="modal-orb">＋</span>
+              <button type="button" onClick={() => setAdding(false)}>
+                ×
+              </button>
+            </div>
+            <small>NEW ASSIGNMENT</small>
+            <h2>What&apos;s coming up?</h2>
+            <div className="form-pair">
+              <label>
+                Class
+                <select name="subject">
+                  {profile?.classes.map((name) => (
+                    <option key={name}>{name}</option>
+                  ))}
+                </select>
+              </label>
+              <label>
+                Due date & time
+                <input name="due" type="datetime-local" required />
+              </label>
+            </div>
+            <label>
+              Assignment
+              <input name="title" placeholder="Lab report" required />
+            </label>
+            <div className="form-pair">
+              <label>
+                Priority
+                <select name="priority">
+                  <option>High</option>
+                  <option>Medium</option>
+                  <option>Low</option>
+                </select>
+              </label>
+              <label>
+                Estimated hours
+                <input
+                  name="hours"
+                  type="number"
+                  min=".5"
+                  step=".5"
+                  defaultValue="2"
+                  required
+                />
+              </label>
+            </div>
+            <label>
+              Reminder Time
+              <select
+                name="reminderChoice"
+                value={reminderChoice}
+                onChange={(event) => setReminderChoice(event.target.value)}
+              >
+                <option>1 Hour Before</option>
+                <option>2 Hours Before</option>
+                <option>1 Day Before</option>
+                <option>2 Days Before</option>
+                <option>1 Week Before</option>
+                <option>Custom</option>
+                <option>Never</option>
+              </select>
+              <small>
+                Reminder times use your device&apos;s current time zone.
+              </small>
+            </label>
+            {reminderChoice === "Custom" && (
+              <label className="custom-reminder">
+                Custom reminder date & time
+                <input name="customReminder" type="datetime-local" required />
+                <small>
+                  Choose an exact local date and time before the assignment is
+                  due.
+                </small>
+              </label>
+            )}
+            <button className="bright-button wide">Add & generate plan</button>
+          </form>
+        </Overlay>
+      )}
+      {toast && (
+        <div className="dark-toast">
+          <span>✦</span>
+          {toast}
+        </div>
+      )}
+    </main>
+  );
+}
+function AuthScreen({
+  onSession,
+}: {
+  onSession: (s: AuthSession) => Promise<void>;
+}) {
+  const [mode, setMode] = useState<"login" | "signup" | "reset">("login"),
+    [message, setMessage] = useState(""),
+    [busy, setBusy] = useState(false);
+  async function submit(e: FormEvent<HTMLFormElement>) {
+    e.preventDefault();
+    setBusy(true);
+    setMessage("");
+    const f = new FormData(e.currentTarget),
+      email = String(f.get("email")),
+      password = String(f.get("password") || ""),
+      path =
+        mode === "signup"
+          ? "signup"
+          : mode === "reset"
+            ? "recover"
+            : "token?grant_type=password",
+      body =
+        mode === "reset"
+          ? { email, redirect_to: window.location.origin }
+          : { email, password },
+      response = await supabaseAuth(path, body),
+      data = (await response.json()) as AuthSession & {
+        msg?: string;
+        message?: string;
+        error_description?: string;
+      };
+    setBusy(false);
+    if (!response.ok) {
+      setMessage(
+        data.msg ||
+          data.message ||
+          data.error_description ||
+          "Please try again.",
+      );
+      return;
+    }
+    if (mode === "signup") {
+      if (data.access_token) await onSession(data);
+      else
+        setMessage("Check your email to confirm your account, then sign in.");
+      return;
+    }
+    if (mode === "reset") {
+      setMessage("Password reset instructions are on their way.");
+      return;
+    }
+    await onSession(data);
+  }
+  return (
+    <main className="auth-page">
+      <div className="auth-glow auth-glow-one" />
+      <div className="auth-glow auth-glow-two" />
+      <section className="auth-copy">
+        <a className="brand auth-brand" href="#">
+          <span className="brand-mark">A</span>
+          <span>Aster</span>
+        </a>
+        <span className="auth-kicker">YOUR TIME, INTELLIGENTLY PLANNED</span>
+        <h1>
+          Homework feels lighter
+          <br />
+          when there&apos;s a <em>plan.</em>
+        </h1>
+        <p>
+          Aster turns every deadline into a calm, balanced study schedule—built
+          around your actual week.
+        </p>
+        <div className="auth-benefits">
+          <span>
+            <i>01</i> Add assignments
+          </span>
+          <span>
+            <i>02</i> Let Aster schedule
+          </span>
+          <span>
+            <i>03</i> Make steady progress
+          </span>
+        </div>
+      </section>
+      <section className="auth-card">
+        <div className="auth-orb">✦</div>
+        <small>
+          {mode === "signup"
+            ? "CREATE YOUR ACCOUNT"
+            : mode === "reset"
+              ? "RESET YOUR PASSWORD"
+              : "WELCOME BACK"}
+        </small>
+        <h2>
+          {mode === "signup"
+            ? "Start planning calmly."
+            : mode === "reset"
+              ? "Let’s get you back in."
+              : "Your study space awaits."}
+        </h2>
+        <p>
+          {mode === "signup"
+            ? "Use your email and create a secure password."
+            : mode === "reset"
+              ? "Enter your email for reset instructions."
+              : "Sign in with your Aster account."}
+        </p>
+        <form className="auth-form" onSubmit={submit}>
+          <label>
+            Email
+            <input
+              name="email"
+              type="email"
+              placeholder="you@example.com"
+              required
+            />
+          </label>
+          {mode !== "reset" && (
+            <label>
+              Password
+              <input
+                name="password"
+                type="password"
+                minLength={8}
+                placeholder="At least 8 characters"
+                required
+              />
+            </label>
+          )}
+          {message && <div className="auth-message">{message}</div>}
+          <button className="signin-button" disabled={busy}>
+            <span>✦</span>
+            {busy
+              ? "Please wait…"
+              : mode === "signup"
+                ? "Create account"
+                : mode === "reset"
+                  ? "Send reset link"
+                  : "Sign in"}
+            <b>→</b>
+          </button>
+        </form>
+        <div className="auth-switch">
+          {mode === "login" ? (
+            <>
+              <button onClick={() => setMode("signup")}>
+                Create an account
+              </button>
+              <button onClick={() => setMode("reset")}>Forgot password?</button>
+            </>
+          ) : (
+            <button onClick={() => setMode("login")}>← Back to sign in</button>
+          )}
+        </div>
+        <div className="secure-note">
+          <span>◇</span>
+          <p>
+            <strong>Secured by Supabase</strong>
+            <br />
+            Passwords are encrypted and never stored by Aster.
+          </p>
+        </div>
+      </section>
+    </main>
+  );
+}
+function Overlay({ children }: { children: React.ReactNode }) {
+  return <div className="dark-overlay">{children}</div>;
+}
+function Empty({ action }: { action: () => void }) {
+  return (
+    <div className="empty-state">
+      <span>✦</span>
+      <h3>Your schedule is wide open</h3>
+      <p>
+        Add an assignment and Aster will divide the work into calm, focused
+        sessions.
+      </p>
+      <button onClick={action}>Add your first assignment</button>
+    </div>
+  );
+}
+function computeReminderAt(dueIso: string, choice: string, custom: string) {
+  if (choice === "Never") return null;
+  if (choice === "Custom")
+    return custom ? new Date(custom).toISOString() : null;
+  const offsets: Record<string, number> = {
+    "1 Hour Before": 60 * 60 * 1000,
+    "2 Hours Before": 2 * 60 * 60 * 1000,
+    "1 Day Before": 24 * 60 * 60 * 1000,
+    "2 Days Before": 2 * 24 * 60 * 60 * 1000,
+    "1 Week Before": 7 * 24 * 60 * 60 * 1000,
+  };
+  return new Date(
+    new Date(dueIso).getTime() - (offsets[choice] || 0),
+  ).toISOString();
+}
+async function readJson<T>(response: Response): Promise<T | null> {
+  const text = await response.text();
+  if (!text) return null;
+  try {
+    return JSON.parse(text) as T;
+  } catch {
+    return null;
+  }
+}
