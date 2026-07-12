@@ -1,6 +1,8 @@
 /** Cloudflare Worker entry point for the vinext-starter template. */
 import { handleImageOptimization, DEFAULT_DEVICE_SIZES, DEFAULT_IMAGE_SIZES } from "vinext/server/image-optimization";
 import handler from "vinext/server/app-router-entry";
+import { markMissedAndReschedule,normalizePlannerState,type PlannerState } from "../lib/planner";
+import { explainScheduleChange } from "../lib/openai-study";
 
 interface Env {
   ASSETS: Fetcher;
@@ -15,6 +17,10 @@ interface Env {
   RESEND_API_KEY?: string;
   REMINDER_FROM_EMAIL?: string;
   HOME_URL?: string;
+  GOOGLE_CLIENT_ID?: string;
+  GOOGLE_CLIENT_SECRET?: string;
+  TOKEN_ENCRYPTION_KEY?: string;
+  OPENAI_API_KEY?: string;
 }
 
 interface ExecutionContext {
@@ -46,7 +52,7 @@ const worker = {
     return handler.fetch(request, env, ctx);
   },
   async scheduled(_controller: ScheduledController, env: Env, ctx: ExecutionContext) {
-    ctx.waitUntil(sendDueReminders(env));
+    ctx.waitUntil(Promise.all([sendDueReminders(env),rescheduleMissedWork(env),syncConnectedCalendars(env)]));
   },
 };
 
@@ -66,6 +72,20 @@ async function sendDueReminders(env:Env){
     else await env.DB.prepare("UPDATE assignments SET reminder_attempts=reminder_attempts+1 WHERE id=?").bind(item.id).run();
   }
 }
+
+async function rescheduleMissedWork(env:Env){
+  await env.DB.prepare("CREATE TABLE IF NOT EXISTS planner_state (user_email TEXT PRIMARY KEY NOT NULL, state TEXT NOT NULL, updated_at INTEGER NOT NULL DEFAULT (unixepoch()))").run();
+  const rows=await env.DB.prepare("SELECT user_email,state FROM planner_state LIMIT 100").all<{user_email:string;state:string}>();
+  for(const row of rows.results){try{const before=normalizePlannerState(JSON.parse(row.state) as PlannerState),next=markMissedAndReschedule(before);if(next.revisions.length!==before.revisions.length){next.revisions[0].explanation=await explainScheduleChange(env.OPENAI_API_KEY,next.revisions[0].reason,next.revisions[0].explanation);await env.DB.prepare("UPDATE planner_state SET state=?,updated_at=unixepoch() WHERE user_email=?").bind(JSON.stringify(next),row.user_email).run()}}catch{/* Keep processing other students if one record is malformed. */}}
+}
+
+async function syncConnectedCalendars(env:Env){
+  if(!env.GOOGLE_CLIENT_ID||!env.GOOGLE_CLIENT_SECRET||!env.TOKEN_ENCRYPTION_KEY)return;
+  await env.DB.batch([env.DB.prepare("CREATE TABLE IF NOT EXISTS calendar_connections (user_email TEXT PRIMARY KEY NOT NULL, provider TEXT NOT NULL, refresh_token TEXT NOT NULL, calendar_id TEXT, provider_email TEXT, sync_token TEXT, status TEXT NOT NULL DEFAULT 'connected', updated_at INTEGER NOT NULL DEFAULT (unixepoch()))"),env.DB.prepare("CREATE TABLE IF NOT EXISTS calendar_event_links (user_email TEXT NOT NULL, session_id TEXT NOT NULL, event_id TEXT NOT NULL, event_updated TEXT, session_updated TEXT, PRIMARY KEY(user_email,session_id))")]);
+  const connections=await env.DB.prepare("SELECT user_email,refresh_token,calendar_id FROM calendar_connections WHERE provider='google' AND status IN ('connected','error') ORDER BY updated_at LIMIT 20").all<{user_email:string;refresh_token:string;calendar_id:string}>();
+  for(const connection of connections.results){try{const refresh=await decryptWorkerToken(connection.refresh_token,env.TOKEN_ENCRYPTION_KEY),tokenResponse=await fetch("https://oauth2.googleapis.com/token",{method:"POST",headers:{"content-type":"application/x-www-form-urlencoded"},body:new URLSearchParams({client_id:env.GOOGLE_CLIENT_ID,client_secret:env.GOOGLE_CLIENT_SECRET,refresh_token:refresh,grant_type:"refresh_token"})}),tokens=await tokenResponse.json() as {access_token?:string};if(!tokens.access_token)throw new Error("Refresh failed");const row=await env.DB.prepare("SELECT state FROM planner_state WHERE user_email=?").bind(connection.user_email).first<{state:string}>();if(!row)continue;const state=normalizePlannerState(JSON.parse(row.state) as PlannerState),links=await env.DB.prepare("SELECT session_id,event_id,session_updated FROM calendar_event_links WHERE user_email=?").bind(connection.user_email).all<{session_id:string;event_id:string;session_updated:string}>(),bySession=new Map(links.results.map(item=>[item.session_id,item])),calendarId=encodeURIComponent(connection.calendar_id||"primary");for(const session of state.sessions){const link=bySession.get(session.id);if(session.status!=="planned"){if(link){await fetch(`https://www.googleapis.com/calendar/v3/calendars/${calendarId}/events/${encodeURIComponent(link.event_id)}`,{method:"DELETE",headers:{authorization:`Bearer ${tokens.access_token}`}});await env.DB.prepare("DELETE FROM calendar_event_links WHERE user_email=? AND session_id=?").bind(connection.user_email,session.id).run()}continue}const event={summary:`${session.subject}: ${session.title}`,description:"Aster study session",start:{dateTime:session.start,timeZone:state.preferences.timezone},end:{dateTime:session.end,timeZone:state.preferences.timezone},extendedProperties:{private:{asterSessionId:session.id}}};if(!link){const response=await fetch(`https://www.googleapis.com/calendar/v3/calendars/${calendarId}/events`,{method:"POST",headers:{authorization:`Bearer ${tokens.access_token}`,"content-type":"application/json"},body:JSON.stringify(event)}),created=await response.json() as {id?:string;updated?:string};if(created.id)await env.DB.prepare("INSERT INTO calendar_event_links (user_email,session_id,event_id,event_updated,session_updated) VALUES (?,?,?,?,?)").bind(connection.user_email,session.id,created.id,created.updated||"",session.updatedAt).run()}else if(session.updatedAt>(link.session_updated||""))await fetch(`https://www.googleapis.com/calendar/v3/calendars/${calendarId}/events/${encodeURIComponent(link.event_id)}`,{method:"PATCH",headers:{authorization:`Bearer ${tokens.access_token}`,"content-type":"application/json"},body:JSON.stringify(event)})}await env.DB.prepare("UPDATE calendar_connections SET status='connected',updated_at=unixepoch() WHERE user_email=?").bind(connection.user_email).run()}catch{await env.DB.prepare("UPDATE calendar_connections SET status='error',updated_at=unixepoch() WHERE user_email=?").bind(connection.user_email).run()}}
+}
+async function decryptWorkerToken(value:string,secret:string){const encoder=new TextEncoder(),[iv,payload]=value.split("."),decode=(input:string)=>Uint8Array.from(atob(input),character=>character.charCodeAt(0)),digest=await crypto.subtle.digest("SHA-256",encoder.encode(secret)),key=await crypto.subtle.importKey("raw",digest,"AES-GCM",false,["decrypt"]),result=await crypto.subtle.decrypt({name:"AES-GCM",iv:decode(iv)},key,decode(payload));return new TextDecoder().decode(result)}
 
 function reminderEmail(item:ReminderRow,home:string){
   const title=escapeHtml(item.title),course=escapeHtml(item.subject),url=escapeHtml(home),due=escapeHtml(new Date(item.due_at).toLocaleString("en-US",{dateStyle:"full",timeStyle:"short",timeZone:"UTC"}));

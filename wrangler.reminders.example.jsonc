@@ -4,13 +4,21 @@
   "triggers": { "crons": ["* * * * *"] },
   "vars": {
     "HOME_URL": "https://planner.example.com",
-    "REMINDER_FROM_EMAIL": "Aster <reminders@example.com>"
+    "REMINDER_FROM_EMAIL": "Aster <reminders@example.com>",
+    "GOOGLE_CLIENT_ID": "replace-with-google-oauth-client-id",
+    "GOOGLE_REDIRECT_URI": "https://planner.example.com/api/calendar/google/callback"
   },
   "d1_databases": [
     {
       "binding": "DB",
       "database_name": "aster-homework-planner",
       "database_id": "replace-with-your-d1-database-id"
+    }
+  ],
+  "r2_buckets": [
+    {
+      "binding": "UPLOADS",
+      "bucket_name": "aster-private-uploads"
     }
   ]
 }

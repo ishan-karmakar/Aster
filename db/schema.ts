@@ -27,3 +27,40 @@ export const assignments = sqliteTable("assignments", {
   index("assignments_owner_idx").on(table.userEmail),
   index("assignments_reminder_idx").on(table.reminderStatus, table.reminderAt),
 ]);
+
+export const plannerState = sqliteTable("planner_state", {
+  userEmail: text("user_email").primaryKey(),
+  state: text("state").notNull(),
+  updatedAt: integer("updated_at").notNull().default(0),
+});
+
+export const syllabusImports = sqliteTable("syllabus_imports", {
+  id: text("id").primaryKey(),
+  userEmail: text("user_email").notNull(),
+  objectKey: text("object_key"),
+  filename: text("filename").notNull(),
+  contentType: text("content_type").notNull(),
+  status: text("status").notNull(),
+  extracted: text("extracted").notNull().default("[]"),
+  createdAt: integer("created_at").notNull().default(0),
+  updatedAt: integer("updated_at").notNull().default(0),
+}, (table) => [index("syllabus_imports_owner_idx").on(table.userEmail)]);
+
+export const calendarConnections = sqliteTable("calendar_connections", {
+  userEmail: text("user_email").primaryKey(),
+  provider: text("provider").notNull(),
+  refreshToken: text("refresh_token").notNull(),
+  calendarId: text("calendar_id"),
+  providerEmail: text("provider_email"),
+  syncToken: text("sync_token"),
+  status: text("status").notNull().default("connected"),
+  updatedAt: integer("updated_at").notNull().default(0),
+});
+
+export const calendarEventLinks = sqliteTable("calendar_event_links", {
+  userEmail: text("user_email").notNull(),
+  sessionId: text("session_id").notNull(),
+  eventId: text("event_id").notNull(),
+  eventUpdated: text("event_updated"),
+  sessionUpdated: text("session_updated"),
+}, (table) => [uniqueIndex("calendar_event_links_owner_session_idx").on(table.userEmail, table.sessionId)]);

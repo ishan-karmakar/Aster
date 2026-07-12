@@ -7,4 +7,4 @@ export async function getD1(): Promise<D1Database | null> {
     return null;
   }
 }
-
+export async function getR2(): Promise<R2Bucket | null> {try{const specifier="cloudflare:workers",runtime=await import(/* webpackIgnore: true */ specifier) as {env?:{UPLOADS?:R2Bucket}};return runtime.env?.UPLOADS??null}catch{return null}}

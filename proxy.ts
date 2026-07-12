@@ -1,0 +1,4 @@
+import { NextRequest,NextResponse } from "next/server";
+const windows=new Map<string,{count:number;reset:number}>();
+export function proxy(request:NextRequest){if(request.method!=="POST")return NextResponse.next();const ip=request.headers.get("cf-connecting-ip")||request.headers.get("x-forwarded-for")?.split(",")[0]||"local",key=`${ip}:${request.nextUrl.pathname}`,now=Date.now(),current=windows.get(key);if(!current||current.reset<now){windows.set(key,{count:1,reset:now+60000});return NextResponse.next()}const limit=request.nextUrl.pathname.startsWith("/api/imports")?5:20;if(current.count>=limit)return Response.json({error:"Too many requests. Wait a minute and try again."},{status:429,headers:{"retry-after":String(Math.ceil((current.reset-now)/1000))}});current.count+=1;return NextResponse.next()}
+export const config={matcher:["/api/imports/:path*","/api/ai/:path*"]};

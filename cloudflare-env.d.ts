@@ -1,6 +1,7 @@
 declare module "cloudflare:workers" {
-  export const env: { DB?: D1Database };
+  export const env: { DB?: D1Database; UPLOADS?: R2Bucket };
 }
+interface R2Bucket { put(key:string,value:ArrayBuffer|Uint8Array|ReadableStream,options?:{httpMetadata?:{contentType?:string}}):Promise<unknown>; get(key:string):Promise<{arrayBuffer():Promise<ArrayBuffer>}|null>; delete(key:string):Promise<void>; }
 
 interface Fetcher {
   fetch(request: Request): Promise<Response>;
